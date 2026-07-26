@@ -744,6 +744,7 @@ function renderStaffLogin(){
       errBox.innerHTML = `<div class="msg err">Incorrect Staff ID or PIN.</div>`; return;
     }
     currentStaffId = id; currentStaffData = doc.data();
+    localStorage.setItem('eams_staff_session', id);
     if(!currentStaffData.consentAcceptedAt){ currentRoute='staffConsent'; }
     else { currentRoute='staffHome'; }
     render();
@@ -814,6 +815,7 @@ async function renderStaffHome(){
 
   document.getElementById('stLogout').onclick = ()=>{
     clearAllPingTimers();
+    localStorage.removeItem('eams_staff_session');
     currentStaffId=null; currentStaffData=null; currentRoute='staffLogin'; render();
   };
 
@@ -831,7 +833,7 @@ async function renderStaffHome(){
       <button class="btn primary block" id="startCheckoutBtn">End Shift — Check-Out</button>`;
     document.getElementById('addStationBtn').onclick = ()=>renderCaptureScreen('station', date, def, shiftCode);
     document.getElementById('startCheckoutBtn').onclick = ()=>renderCaptureScreen('checkout', date, def, shiftCode);
-    if(!shiftActive){ startSilentPings(def); }
+    resumePings();
   } else {
     actionBox.innerHTML = `<div class="card"><div class="msg ok">Shift complete for today. See you next shift.</div></div>`;
     clearAllPingTimers();
@@ -879,6 +881,7 @@ function renderCaptureScreen(kind, date, def, shiftCode){
     const payload = {time, lat: loc?loc.lat:null, lng: loc?loc.lng:null, photoId};
     if(kind==='checkin'){
       await attRef.set({staffId:currentStaffId, date, shiftCode: shiftCode||null, checkin:payload}, {merge:true});
+      if(def) await initPingSchedule(def, date);
     } else if(kind==='checkout'){
       await attRef.set({checkout:payload}, {merge:true});
       clearAllPingTimers();
@@ -889,31 +892,81 @@ function renderCaptureScreen(kind, date, def, shiftCode){
   };
 }
 
-/* ---- Silent verification pings: while app open only, guaranteed 1/hour at random minute, no UI shown to staff ---- */
+/* ---- Silent verification pings: persisted schedule, self-heals on every app open/resume ---- */
 function clearAllPingTimers(){ pingTimers.forEach(t=>clearTimeout(t)); pingTimers=[]; shiftActive=false; }
 
-function startSilentPings(def){
-  shiftActive = true;
+function computePlannedOffsets(def){
   const range = shiftMinutesRange(def);
   const durationMin = Math.min(range.duration, 16*60); // cap safety
   const hourBuckets = Math.ceil(durationMin/60);
+  const offsets = [];
   for(let i=0;i<hourBuckets;i++){
     const fireAtMin = i*60 + Math.floor(Math.random()*60);
-    if(fireAtMin >= durationMin) continue;
-    const delay = fireAtMin*60*1000;
-    const t = setTimeout(()=>silentPing(), delay);
-    pingTimers.push(t);
+    if(fireAtMin < durationMin) offsets.push(fireAtMin);
+  }
+  return offsets;
+}
+
+// Called once, right when check-in is confirmed: locks in the shift's ping schedule server-side
+// so it survives the app being closed, killed, or reopened later — not just held in memory.
+async function initPingSchedule(def, date){
+  const offsets = computePlannedOffsets(def);
+  const attRef = db.collection('attendance').doc(`${currentStaffId}_${date}`);
+  await attRef.set({
+    plannedPingOffsets: offsets,
+    checkinEpochMs: Date.now()
+  }, {merge:true});
+}
+
+// Called whenever the app is opened, reopened, or brought back to the foreground during an active shift.
+// Fires any pings that were due while the app was away (catch-up), then schedules the rest for
+// as long as this session happens to stay open. Safe to call repeatedly — already-fired pings are skipped.
+async function resumePings(){
+  if(!currentStaffId) return;
+  const date = todayStr();
+  const attRef = db.collection('attendance').doc(`${currentStaffId}_${date}`);
+  const attDoc = await attRef.get();
+  if(!attDoc.exists) return;
+  const att = attDoc.data();
+  if(!att.checkin || att.checkout) { clearAllPingTimers(); return; } // shift not active
+
+  let offsets = att.plannedPingOffsets;
+  let checkinEpochMs = att.checkinEpochMs;
+  if(!offsets || !checkinEpochMs){
+    // legacy fallback: shift started before this schedule existed — build one now
+    const schedDoc = await db.collection('schedule').doc(`${currentStaffId}_${date}`).get();
+    const defsMap = await getShiftDefsMap();
+    const def = schedDoc.exists ? defsMap[schedDoc.data().shiftCode] : null;
+    offsets = def ? computePlannedOffsets(def) : [];
+    checkinEpochMs = Date.now() - 60000; // assume ~just started
+    await attRef.set({plannedPingOffsets: offsets, checkinEpochMs}, {merge:true});
+  }
+
+  clearAllPingTimers();
+  shiftActive = true;
+  const alreadyFired = new Set((att.pings||[]).map(p=>p.offset).filter(o=>o!=null));
+  const elapsedMin = (Date.now() - checkinEpochMs) / 60000;
+
+  for(const offset of offsets){
+    if(alreadyFired.has(offset)) continue;
+    if(offset <= elapsedMin){
+      await silentPing(offset); // overdue — catch up immediately
+    } else {
+      const delay = (offset - elapsedMin) * 60000;
+      const t = setTimeout(()=>silentPing(offset), delay);
+      pingTimers.push(t);
+    }
   }
 }
 
-async function silentPing(){
+async function silentPing(offset){
   const date = todayStr();
   const attRef = db.collection('attendance').doc(`${currentStaffId}_${date}`);
   const attDoc = await attRef.get();
   if(!attDoc.exists || !attDoc.data().checkin || attDoc.data().checkout) return; // not on active shift anymore
   const loc = await getLoc();
   const captured = !!loc;
-  const entry = {time: timeStr(), lat: loc?loc.lat:null, lng: loc?loc.lng:null, captured};
+  const entry = {time: timeStr(), lat: loc?loc.lat:null, lng: loc?loc.lng:null, captured, offset};
   await attRef.set({pings: firebase.firestore.FieldValue.arrayUnion(entry)}, {merge:true});
   if(!captured){
     missedPingStreak++;
@@ -930,9 +983,31 @@ async function silentPing(){
   }
 }
 
+// Whenever the tab/app comes back into view, immediately re-check for overdue pings —
+// this is what lets staff use their phone normally between glances at the app.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible' && currentStaffId && currentRoute === 'staffHome'){
+    resumePings();
+  }
+});
+
 /* ================= BOOT ================= */
-auth.onAuthStateChanged(()=>{ /* no-op: routing handled explicitly by user actions */ });
-render();
+(async function boot(){
+  const savedId = localStorage.getItem('eams_staff_session');
+  if(savedId){
+    try{
+      if(!auth.currentUser){ await auth.signInAnonymously(); }
+      const doc = await db.collection('staff').doc(savedId).get();
+      if(doc.exists && doc.data().active !== false){
+        currentStaffId = savedId; currentStaffData = doc.data();
+        currentRoute = currentStaffData.consentAcceptedAt ? 'staffHome' : 'staffConsent';
+      } else {
+        localStorage.removeItem('eams_staff_session');
+      }
+    }catch(e){ /* fall through to normal login screen */ }
+  }
+  render();
+})();
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
